@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Iterator, Tuple
+
+import numpy as np
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+IUPAC_DNA = set("ACGTRYSWKMBDHVN")
+
+EXPRESSION_HEADER_RE = re.compile(
+    r"^(?P<promoter_id>[^|\s]+)\|exp="
+    r"(?P<expression>[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    r"(?:[eE][+-]?\d+)?)"
+    r"(?:\s.*)?$"
+)
+
+MODEL_NAME = "zhihan1996/DNABERT-2-117M"
+EXPECTED_DIM = 768
+
+STATUS_PENDING = np.uint8(0)
+STATUS_SUCCESS = np.uint8(1)
+STATUS_FAILED = np.uint8(2)
+
+
+# =============================================================================
+# FASTA parsing
+# =============================================================================
+
+def parse_fasta_header(
+    header: str,
+    line_number: int,
+    fasta_path: Path,
+) -> Tuple[str, float]:
+    match = EXPRESSION_HEADER_RE.fullmatch(header.strip())
+
+    if match is None:
+        raise ValueError(
+            f"Invalid FASTA header at line {line_number}: {header!r}\n"
+            "Expected format: >promoter_id|exp=<numeric_expression>\n"
+            f"FASTA: {fasta_path}"
+        )
+
+    promoter_id = match.group("promoter_id")
+    expression_text = match.group("expression")
+    expression = float(expression_text)
+
+    if not np.isfinite(expression):
+        raise ValueError(
+            f"Expression must be finite at line {line_number}: "
+            f"{expression_text!r}"
+        )
+
+    return promoter_id, expression
+
+
+def iterate_fasta(
+    fasta_path: Path,
+) -> Iterator[Tuple[str, float, str]]:
+    """
+    Yields
+    ------
+    promoter_id, expression, raw_sequence
+    """
+    promoter_id: str | None = None
+    expression: float | None = None
+    sequence_chunks: list[str] = []
+
+    with fasta_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                if promoter_id is not None:
+                    yield (
+                        promoter_id,
+                        float(expression),
+                        "".join(sequence_chunks),
+                    )
+
+                header = line[1:].strip()
+
+                if not header:
+                    raise ValueError(
+                        f"Empty FASTA header at line {line_number}: "
+                        f"{fasta_path}"
+                    )
+
+                promoter_id, expression = parse_fasta_header(
+                    header=header,
+                    line_number=line_number,
+                    fasta_path=fasta_path,
+                )
+
+                sequence_chunks = []
+
+            else:
+                if promoter_id is None:
+                    raise ValueError(
+                        "Sequence data was found before the first FASTA "
+                        f"header at line {line_number}: {fasta_path}"
+                    )
+
+                sequence_chunks.append(line)
+
+    if promoter_id is not None:
+        yield (
+            promoter_id,
+            float(expression),
+            "".join(sequence_chunks),
+        )
+
+
+def count_fasta_records(fasta_path: Path) -> int:
+    count = 0
+
+    with fasta_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if raw_line.lstrip().startswith(">"):
+                count += 1
+
+    return count
+
+
+# =============================================================================
+# Sequence preprocessing
+# =============================================================================
+
+def write_warning(warning_handle, message: str) -> None:
+    print(message)
+    warning_handle.write(message + "\n")
+    warning_handle.flush()
+
+
+def clean_dna_sequence(
+    raw_sequence: str,
+    promoter_id: str,
+    warning_handle,
+) -> str:
+    sequence = re.sub(r"\s+", "", raw_sequence).upper()
+
+    if "U" in sequence:
+        write_warning(
+            warning_handle,
+            f"[WARN] U converted to T: {promoter_id}",
+        )
+        sequence = sequence.replace("U", "T")
+
+    if "-" in sequence or "." in sequence:
+        write_warning(
+            warning_handle,
+            f"[WARN] gap characters removed: {promoter_id}",
+        )
+        sequence = sequence.replace("-", "").replace(".", "")
+
+    invalid_characters = sorted(set(sequence) - IUPAC_DNA)
+
+    if invalid_characters:
+        raise ValueError(
+            f"Invalid DNA character(s): {invalid_characters}. "
+            "Allowed IUPAC symbols are ACGTRYSWKMBDHVN."
+        )
+
+    return sequence
+
+
+# =============================================================================
+# Device, pooling and DNABERT-2 embedding
+# =============================================================================
+
+def choose_device(requested_device: str) -> torch.device:
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print("[INFO] CUDA is unavailable. Falling back to CPU.")
+        return torch.device("cpu")
+
+    return torch.device(requested_device)
+
+
+def pool_embeddings(
+    valid_embeddings: torch.Tensor,
+    pooling: str,
+) -> torch.Tensor:
+    if valid_embeddings.ndim != 2:
+        raise ValueError(
+            "Expected 2D embeddings, observed shape="
+            f"{tuple(valid_embeddings.shape)}"
+        )
+
+    if valid_embeddings.shape[0] == 0:
+        raise ValueError(
+            "No valid token remained for pooling."
+        )
+
+    valid_embeddings = valid_embeddings.float()
+
+    if pooling == "mean":
+        return valid_embeddings.mean(dim=0)
+
+    if pooling == "max":
+        return valid_embeddings.max(dim=0).values
+
+    raise ValueError(
+        f"Unsupported pooling method: {pooling!r}"
+    )
+
+
+def build_valid_token_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    tokenizer,
+) -> torch.Tensor:
+    valid_mask = attention_mask.bool().clone()
+
+    for special_id in set(tokenizer.all_special_ids):
+        valid_mask &= input_ids != special_id
+
+    return valid_mask
+
+
+def get_last_hidden_state(output) -> torch.Tensor:
+    if hasattr(output, "last_hidden_state"):
+        hidden = output.last_hidden_state
+
+    elif isinstance(output, (tuple, list)):
+        if len(output) == 0:
+            raise ValueError(
+                "DNABERT-2 returned an empty tuple/list."
+            )
+        hidden = output[0]
+
+    elif isinstance(output, dict):
+        if "last_hidden_state" not in output:
+            raise KeyError(
+                "DNABERT-2 output dictionary does not contain "
+                "'last_hidden_state'."
+            )
+        hidden = output["last_hidden_state"]
+
+    else:
+        raise TypeError(
+            "Unsupported DNABERT-2 output type: "
+            f"{type(output).__name__}. "
+            "Expected ModelOutput, tuple/list, or dict."
+        )
+
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError(
+            "DNABERT-2 hidden state is not a torch.Tensor: "
+            f"{type(hidden).__name__}"
+        )
+
+    return hidden
+
+
+def extract_dnabert2_embedding(
+    sequence: str,
+    tokenizer,
+    model,
+    device: torch.device,
+    max_tokens: int | None,
+    pooling: str,
+) -> tuple[np.ndarray, int, bool]:
+    tokenizer_kwargs = {
+        "return_tensors": "pt",
+        "return_attention_mask": True,
+        "add_special_tokens": True,
+        "truncation": max_tokens is not None,
+    }
+
+    if max_tokens is not None:
+        tokenizer_kwargs["max_length"] = max_tokens
+
+    batch = tokenizer(
+        sequence,
+        **tokenizer_kwargs,
+    )
+
+    batch = {
+        key: value.to(device)
+        for key, value in batch.items()
+    }
+
+    with torch.inference_mode():
+        output = model(
+            **batch,
+            return_dict=True,
+        )
+
+    hidden = get_last_hidden_state(output)
+
+    if hidden.ndim != 3 or hidden.shape[0] != 1:
+        raise ValueError(
+            "Unexpected DNABERT-2 hidden-state shape: "
+            f"{tuple(hidden.shape)}"
+        )
+
+    if hidden.shape[-1] != EXPECTED_DIM:
+        raise ValueError(
+            "Unexpected DNABERT-2 hidden dimension: "
+            f"{hidden.shape[-1]} "
+            f"(expected {EXPECTED_DIM})"
+        )
+
+    input_ids = batch["input_ids"]
+
+    attention_mask = batch.get(
+        "attention_mask",
+        torch.ones_like(input_ids),
+    )
+
+    valid_mask = build_valid_token_mask(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        tokenizer=tokenizer,
+    )
+
+    if valid_mask.shape[:2] != hidden.shape[:2]:
+        raise ValueError(
+            "DNABERT-2 hidden/mask shape mismatch: "
+            f"hidden={tuple(hidden.shape)}, "
+            f"mask={tuple(valid_mask.shape)}"
+        )
+
+    valid_embeddings = hidden[valid_mask]
+
+    token_count = int(valid_embeddings.shape[0])
+
+    pooled = pool_embeddings(
+        valid_embeddings=valid_embeddings,
+        pooling=pooling,
+    )
+
+    vector = pooled.detach().cpu().numpy()
+
+    if vector.ndim != 1:
+        raise ValueError(
+            "Expected a 1D pooled embedding, observed "
+            f"shape={vector.shape}"
+        )
+
+    if vector.shape[0] != EXPECTED_DIM:
+        raise ValueError(
+            "Unexpected pooled embedding dimension: "
+            f"{vector.shape[0]} "
+            f"(expected {EXPECTED_DIM})"
+        )
+
+    encoded_length = int(input_ids.shape[1])
+
+    was_truncated = (
+        max_tokens is not None
+        and encoded_length >= max_tokens
+    )
+
+    return vector, token_count, was_truncated
+
+
+# =============================================================================
+# Output file paths
+# =============================================================================
+
+def build_output_paths(output_prefix: Path) -> dict[str, Path]:
+    parent = output_prefix.parent
+    stem = output_prefix.name
+
+    return {
+        "embeddings": parent / f"{stem}_embeddings.npy",
+        "expressions": parent / f"{stem}_expressions.npy",
+        "status": parent / f"{stem}_status.npy",
+        "meta": parent / f"{stem}_meta.csv",
+        "warnings": parent / f"{stem}_warnings.log",
+        "config": parent / f"{stem}_run_config.json",
+    }
+
+
+def write_metadata_csv(
+    fasta_path: Path,
+    metadata_path: Path,
+    total_records: int,
+) -> None:
+    print(f"[META] Creating metadata CSV: {metadata_path}")
+
+    metadata_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    written_records = 0
+
+    with metadata_path.open(
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(
+            [
+                "row_index",
+                "promoter_id",
+                "expression",
+                "raw_sequence_length",
+            ]
+        )
+
+        for row_index, (
+            promoter_id,
+            expression,
+            raw_sequence,
+        ) in enumerate(iterate_fasta(fasta_path)):
+
+            raw_sequence_length = len(
+                re.sub(r"\s+", "", raw_sequence)
+            )
+
+            writer.writerow(
+                [
+                    row_index,
+                    promoter_id,
+                    expression,
+                    raw_sequence_length,
+                ]
+            )
+
+            written_records += 1
+
+            if written_records % 100000 == 0:
+                print(
+                    f"[META] "
+                    f"{written_records:,}/{total_records:,}"
+                )
+
+    if written_records != total_records:
+        raise RuntimeError(
+            "Metadata record count mismatch: "
+            f"expected={total_records:,}, "
+            f"written={written_records:,}"
+        )
+
+    print(
+        f"[META] Saved: {metadata_path} | "
+        f"n_records={written_records:,}"
+    )
+
+
+def write_run_config(
+    config_path: Path,
+    args,
+    paths: dict[str, Path],
+    total_records: int,
+    storage_dtype: np.dtype,
+) -> None:
+    config = {
+        "input_fasta": str(
+            Path(args.input_fasta).resolve()
+        ),
+        "output_prefix": str(
+            Path(args.output_prefix).resolve()
+        ),
+        "model_name": MODEL_NAME,
+        "embedding_dimension": EXPECTED_DIM,
+        "number_of_records": total_records,
+        "device": args.device,
+        "model_dtype": args.dtype,
+        "storage_dtype": str(storage_dtype),
+        "pooling": args.pooling,
+        "max_tokens": args.max_tokens,
+        "flush_interval": args.flush_interval,
+        "progress_interval": args.progress_interval,
+        "empty_cache_interval": args.empty_cache_interval,
+        "retry_failed": args.retry_failed,
+        "files": {
+            key: str(value.resolve())
+            for key, value in paths.items()
+        },
+        "status_codes": {
+            "0": "pending",
+            "1": "success",
+            "2": "failed",
+        },
+        "representation": "last_hidden_state",
+        "special_tokens_excluded_from_pooling": True,
+    }
+
+    config_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with config_path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            config,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+# =============================================================================
+# NPY initialization and resume
+# =============================================================================
+
+def initialize_output_arrays(
+    paths: dict[str, Path],
+    total_records: int,
+    storage_dtype: np.dtype,
+) -> tuple[np.memmap, np.memmap, np.memmap]:
+    print("[INIT] Creating NPY memmap files")
+
+    embeddings = np.lib.format.open_memmap(
+        paths["embeddings"],
+        mode="w+",
+        dtype=storage_dtype,
+        shape=(total_records, EXPECTED_DIM),
+    )
+
+    expressions = np.lib.format.open_memmap(
+        paths["expressions"],
+        mode="w+",
+        dtype=np.float32,
+        shape=(total_records,),
+    )
+
+    status = np.lib.format.open_memmap(
+        paths["status"],
+        mode="w+",
+        dtype=np.uint8,
+        shape=(total_records,),
+    )
+
+    embeddings[:] = np.nan
+    expressions[:] = np.nan
+    status[:] = STATUS_PENDING
+
+    embeddings.flush()
+    expressions.flush()
+    status.flush()
+
+    return embeddings, expressions, status
+
+
+def load_existing_output_arrays(
+    paths: dict[str, Path],
+    total_records: int,
+    storage_dtype: np.dtype,
+) -> tuple[np.memmap, np.memmap, np.memmap]:
+    required_paths = [
+        paths["embeddings"],
+        paths["expressions"],
+        paths["status"],
+        paths["meta"],
+    ]
+
+    missing_paths = [
+        path
+        for path in required_paths
+        if not path.exists()
+    ]
+
+    if missing_paths:
+        missing_text = "\n".join(
+            f"  - {path}"
+            for path in missing_paths
+        )
+
+        raise FileNotFoundError(
+            "Cannot resume because required files are missing:\n"
+            f"{missing_text}"
+        )
+
+    embeddings = np.lib.format.open_memmap(
+        paths["embeddings"],
+        mode="r+",
+    )
+
+    expressions = np.lib.format.open_memmap(
+        paths["expressions"],
+        mode="r+",
+    )
+
+    status = np.lib.format.open_memmap(
+        paths["status"],
+        mode="r+",
+    )
+
+    expected_embedding_shape = (
+        total_records,
+        EXPECTED_DIM,
+    )
+
+    if embeddings.shape != expected_embedding_shape:
+        raise RuntimeError(
+            "Existing embedding shape mismatch: "
+            f"expected={expected_embedding_shape}, "
+            f"observed={embeddings.shape}"
+        )
+
+    if embeddings.dtype != storage_dtype:
+        raise RuntimeError(
+            "Existing embedding dtype mismatch: "
+            f"expected={storage_dtype}, "
+            f"observed={embeddings.dtype}"
+        )
+
+    if expressions.shape != (total_records,):
+        raise RuntimeError(
+            "Existing expression shape mismatch: "
+            f"expected={(total_records,)}, "
+            f"observed={expressions.shape}"
+        )
+
+    if status.shape != (total_records,):
+        raise RuntimeError(
+            "Existing status shape mismatch: "
+            f"expected={(total_records,)}, "
+            f"observed={status.shape}"
+        )
+
+    return embeddings, expressions, status
+
+
+def check_output_conflicts(
+    paths: dict[str, Path],
+    overwrite: bool,
+    resume: bool,
+) -> None:
+    if overwrite and resume:
+        raise ValueError(
+            "--overwrite and --resume cannot be used together."
+        )
+
+    existing_paths = [
+        path
+        for path in paths.values()
+        if path.exists()
+    ]
+
+    if existing_paths and not overwrite and not resume:
+        existing_text = "\n".join(
+            f"  - {path}"
+            for path in existing_paths
+        )
+
+        raise FileExistsError(
+            "Output files already exist:\n"
+            f"{existing_text}\n"
+            "Use --resume to continue or --overwrite to recreate them."
+        )
+
+    if overwrite:
+        for path in existing_paths:
+            print(f"[OVERWRITE] Removing: {path}")
+            path.unlink()
+
+
+# =============================================================================
+# Progress helpers
+# =============================================================================
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days > 0:
+        return (
+            f"{days}d {hours:02d}h "
+            f"{minutes:02d}m {seconds:02d}s"
+        )
+
+    return (
+        f"{hours:02d}h "
+        f"{minutes:02d}m "
+        f"{seconds:02d}s"
+    )
+
+
+def get_status_counts(
+    status: np.ndarray,
+) -> tuple[int, int, int]:
+    pending = int(
+        np.count_nonzero(status == STATUS_PENDING)
+    )
+    success = int(
+        np.count_nonzero(status == STATUS_SUCCESS)
+    )
+    failed = int(
+        np.count_nonzero(status == STATUS_FAILED)
+    )
+
+    return pending, success, failed
+
+
+def print_status_summary(status: np.ndarray) -> None:
+    pending, success, failed = get_status_counts(status)
+
+    print("=" * 80)
+    print("[STATUS]")
+    print(f"Pending: {pending:,}")
+    print(f"Success: {success:,}")
+    print(f"Failed : {failed:,}")
+    print(f"Total  : {len(status):,}")
+    print("=" * 80)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract DNABERT-2 promoter embeddings and save them "
+            "incrementally as NPY memmap files with metadata CSV."
+        )
+    )
+
+    parser.add_argument(
+        "--input_fasta",
+        required=True,
+        help=(
+            "Input FASTA. Header format: "
+            ">promoter_id|exp=<numeric_expression>"
+        ),
+    )
+
+    parser.add_argument(
+        "--output_prefix",
+        required=True,
+        help=(
+            "Output file prefix. Example: "
+            "/path/dnabert2_promoter_mean"
+        ),
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cuda:0",
+        help="PyTorch device. Default: cuda:0",
+    )
+
+    parser.add_argument(
+        "--pooling",
+        choices=["mean", "max"],
+        default="mean",
+    )
+
+    parser.add_argument(
+        "--dtype",
+        choices=[
+            "float32",
+            "float16",
+            "bfloat16",
+        ],
+        default="float32",
+        help="Model computation dtype.",
+    )
+
+    parser.add_argument(
+        "--storage_dtype",
+        choices=[
+            "float32",
+            "float16",
+        ],
+        default="float32",
+        help=(
+            "NPY embedding storage dtype. "
+            "float32 is recommended for preserving precision."
+        ),
+    )
+
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=None,
+        help=(
+            "Optional tokenizer truncation limit. "
+            "Default: no truncation."
+        ),
+    )
+
+    parser.add_argument(
+        "--flush_interval",
+        type=int,
+        default=5000,
+        help=(
+            "Flush NPY files to disk every N newly processed rows. "
+            "Default: 5000"
+        ),
+    )
+
+    parser.add_argument(
+        "--progress_interval",
+        type=int,
+        default=1000,
+        help=(
+            "Print progress every N newly processed rows. "
+            "Default: 1000"
+        ),
+    )
+
+    parser.add_argument(
+        "--empty_cache_interval",
+        type=int,
+        default=0,
+        help=(
+            "Call torch.cuda.empty_cache() every N processed rows. "
+            "0 disables it. Default: 0"
+        ),
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from existing output files. "
+            "Rows with status=1 are skipped."
+        ),
+    )
+
+    parser.add_argument(
+        "--retry_failed",
+        action="store_true",
+        help=(
+            "With --resume, retry rows with status=2. "
+            "Otherwise failed rows are skipped."
+        ),
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete existing output files and start over.",
+    )
+
+    args = parser.parse_args()
+
+    if args.flush_interval <= 0:
+        raise ValueError(
+            "--flush_interval must be greater than 0."
+        )
+
+    if args.progress_interval <= 0:
+        raise ValueError(
+            "--progress_interval must be greater than 0."
+        )
+
+    if args.empty_cache_interval < 0:
+        raise ValueError(
+            "--empty_cache_interval must be 0 or greater."
+        )
+
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        raise ValueError(
+            "--max_tokens must be greater than 0."
+        )
+
+    input_fasta = Path(args.input_fasta).resolve()
+    output_prefix = Path(args.output_prefix).resolve()
+
+    if not input_fasta.is_file():
+        raise FileNotFoundError(
+            f"Input FASTA not found: {input_fasta}"
+        )
+
+    output_prefix.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    paths = build_output_paths(output_prefix)
+    storage_dtype = np.dtype(args.storage_dtype)
+
+    check_output_conflicts(
+        paths=paths,
+        overwrite=args.overwrite,
+        resume=args.resume,
+    )
+
+    print(f"[COUNT] FASTA records: {input_fasta}")
+
+    total_records = count_fasta_records(input_fasta)
+
+    if total_records == 0:
+        raise ValueError(
+            f"No FASTA records found: {input_fasta}"
+        )
+
+    print(f"[COUNT] Total records: {total_records:,}")
+
+    if args.resume:
+        embeddings, expressions, status = (
+            load_existing_output_arrays(
+                paths=paths,
+                total_records=total_records,
+                storage_dtype=storage_dtype,
+            )
+        )
+
+        print("[RESUME] Existing output files loaded.")
+        print_status_summary(status)
+
+    else:
+        write_metadata_csv(
+            fasta_path=input_fasta,
+            metadata_path=paths["meta"],
+            total_records=total_records,
+        )
+
+        embeddings, expressions, status = (
+            initialize_output_arrays(
+                paths=paths,
+                total_records=total_records,
+                storage_dtype=storage_dtype,
+            )
+        )
+
+    write_run_config(
+        config_path=paths["config"],
+        args=args,
+        paths=paths,
+        total_records=total_records,
+        storage_dtype=storage_dtype,
+    )
+
+    device = choose_device(args.device)
+
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+
+    torch_dtype = dtype_map[args.dtype]
+
+    if device.type == "cpu" and torch_dtype == torch.float16:
+        print(
+            "[INFO] CPU selected; changing float16 to float32."
+        )
+        torch_dtype = torch.float32
+        args.dtype = "float32"
+
+    print(f"[LOAD] tokenizer={MODEL_NAME}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+    )
+
+    print(
+        f"[LOAD] model={MODEL_NAME} "
+        f"device={device} "
+        f"model_dtype={args.dtype} "
+        f"storage_dtype={storage_dtype} "
+        f"pooling={args.pooling} "
+        f"max_tokens={args.max_tokens}"
+    )
+
+    model = AutoModel.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+    ).to(device)
+
+    model.eval()
+
+    start_time = time.time()
+
+    newly_processed = 0
+    newly_successful = 0
+    newly_failed = 0
+    skipped = 0
+
+    warning_mode = "a" if args.resume else "w"
+
+    try:
+        with paths["warnings"].open(
+            warning_mode,
+            encoding="utf-8",
+            buffering=1,
+        ) as warning_handle:
+
+            for row_index, (
+                promoter_id,
+                expression,
+                raw_sequence,
+            ) in enumerate(iterate_fasta(input_fasta)):
+
+                current_status = status[row_index]
+
+                if current_status == STATUS_SUCCESS:
+                    skipped += 1
+                    continue
+
+                if (
+                    current_status == STATUS_FAILED
+                    and not args.retry_failed
+                ):
+                    skipped += 1
+                    continue
+
+                display_index = row_index + 1
+
+                print(
+                    f"[{display_index}/{total_records}] "
+                    f"{promoter_id} "
+                    f"expression={expression}"
+                )
+
+                expressions[row_index] = np.float32(
+                    expression
+                )
+
+                try:
+                    sequence = clean_dna_sequence(
+                        raw_sequence=raw_sequence,
+                        promoter_id=promoter_id,
+                        warning_handle=warning_handle,
+                    )
+
+                    if not sequence:
+                        raise ValueError(
+                            "Empty sequence after cleaning."
+                        )
+
+                    vector, token_count, was_truncated = (
+                        extract_dnabert2_embedding(
+                            sequence=sequence,
+                            tokenizer=tokenizer,
+                            model=model,
+                            device=device,
+                            max_tokens=args.max_tokens,
+                            pooling=args.pooling,
+                        )
+                    )
+
+                    embeddings[row_index, :] = vector.astype(
+                        storage_dtype,
+                        copy=False,
+                    )
+
+                    status[row_index] = STATUS_SUCCESS
+                    newly_successful += 1
+
+                    if was_truncated:
+                        message = (
+                            "[WARN] possible truncation: "
+                            f"row_index={row_index} "
+                            f"promoter_id={promoter_id} "
+                            f"max_tokens={args.max_tokens} "
+                            f"valid_token_count={token_count}"
+                        )
+                        write_warning(
+                            warning_handle,
+                            message,
+                        )
+
+                except Exception as error:
+                    embeddings[row_index, :] = np.nan
+                    status[row_index] = STATUS_FAILED
+                    newly_failed += 1
+
+                    message = (
+                        f"[WARN] failed: "
+                        f"row_index={row_index} "
+                        f"promoter_id={promoter_id} -> "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+                    write_warning(
+                        warning_handle,
+                        message,
+                    )
+
+                newly_processed += 1
+
+                if (
+                    device.type == "cuda"
+                    and args.empty_cache_interval > 0
+                    and newly_processed
+                    % args.empty_cache_interval
+                    == 0
+                ):
+                    torch.cuda.empty_cache()
+
+                if (
+                    newly_processed
+                    % args.flush_interval
+                    == 0
+                ):
+                    embeddings.flush()
+                    expressions.flush()
+                    status.flush()
+
+                    print(
+                        "[FLUSH] "
+                        f"newly_processed={newly_processed:,}"
+                    )
+
+                if (
+                    newly_processed
+                    % args.progress_interval
+                    == 0
+                ):
+                    elapsed = time.time() - start_time
+
+                    average_seconds = (
+                        elapsed / newly_processed
+                        if newly_processed > 0
+                        else 0.0
+                    )
+
+                    remaining_candidates = (
+                        total_records
+                        - skipped
+                        - newly_processed
+                    )
+
+                    estimated_remaining = (
+                        average_seconds
+                        * max(0, remaining_candidates)
+                    )
+
+                    print(
+                        "[PROGRESS] "
+                        f"new={newly_processed:,} | "
+                        f"success={newly_successful:,} | "
+                        f"failed={newly_failed:,} | "
+                        f"skipped={skipped:,} | "
+                        f"elapsed="
+                        f"{format_duration(elapsed)} | "
+                        f"estimated_remaining="
+                        f"{format_duration(estimated_remaining)}"
+                    )
+
+    except KeyboardInterrupt:
+        print(
+            "\n[INTERRUPTED] Keyboard interrupt received."
+        )
+        print(
+            "[SAVE] Flushing current NPY files before exit."
+        )
+
+        embeddings.flush()
+        expressions.flush()
+        status.flush()
+
+        print_status_summary(status)
+        sys.exit(130)
+
+    finally:
+        embeddings.flush()
+        expressions.flush()
+        status.flush()
+
+    elapsed = time.time() - start_time
+
+    print_status_summary(status)
+
+    final_pending, final_success, final_failed = (
+        get_status_counts(status)
+    )
+
+    print("=" * 80)
+    print("[COMPLETED]")
+    print(f"Elapsed time : {format_duration(elapsed)}")
+    print(f"Embeddings   : {paths['embeddings']}")
+    print(f"Expressions  : {paths['expressions']}")
+    print(f"Status       : {paths['status']}")
+    print(f"Metadata     : {paths['meta']}")
+    print(f"Warnings     : {paths['warnings']}")
+    print(f"Run config   : {paths['config']}")
+    print(f"Success      : {final_success:,}")
+    print(f"Failed       : {final_failed:,}")
+    print(f"Pending      : {final_pending:,}")
+    print(f"Embedding dim: {EXPECTED_DIM}")
+    print(f"Pooling      : {args.pooling}")
+    print(f"Storage dtype: {storage_dtype}")
+    print("=" * 80)
+
+    if final_pending > 0:
+        print(
+            "[NOTICE] Pending rows remain. "
+            "Run again with --resume."
+        )
+
+    if final_failed > 0:
+        print(
+            "[NOTICE] Failed rows remain. "
+            "Run again with --resume --retry_failed "
+            "to retry them."
+        )
+
+
+if __name__ == "__main__":
+    main()
