@@ -11,7 +11,7 @@ Predict yeast promoter expression from DNA sequence by extracting embeddings, po
 FASTA (>id|exp=value)
    │
    ▼  scripts/run_*_promoter_fasta.py
-Evo2 layer blocks.28.mlp.l3 → per-nucleotide 4,096-d embeddings → mean or max pooling
+Genome language model provides embedding → mean or max pooling
    │  → intermediate:  *_run_config.json
    ▼  scripts/prepare_embeddings.py
 Validate rows, keep successful/finite ones, random train/val split (default 5% val)
