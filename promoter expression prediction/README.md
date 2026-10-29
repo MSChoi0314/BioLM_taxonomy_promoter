@@ -25,5 +25,3 @@ Official DREAM subset scoring (weighted Pearson r² and Spearman ρ)
 ```
 
 `scripts/common.py` holds shared helpers (metrics, streaming feature statistics, atomic JSON writes, seeding) and is imported by `prepare_embeddings.py` and `train_models.py`. Keep all scripts in the same folder.
-
-## Repository layout
