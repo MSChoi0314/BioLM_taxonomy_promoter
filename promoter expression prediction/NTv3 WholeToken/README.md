@@ -15,9 +15,9 @@ NTv3-650M (frozen) → last hidden layer, 1 vector per nucleotide
    ▼  train_token_cnn.py
 TokenResCNN on the token matrices
    │  → intermediate: metrics_ntv3_wholetoken.json
-   ▼  scripts/evaluate_dream.py
+   ▼  evaluate_dream_official.py
 Official DREAM subset scoring (weighted Pearson r² and Spearman ρ)
       
 ```
 
-`scripts/common.py` holds shared helpers (metrics, streaming feature statistics, atomic JSON writes, seeding) and is imported by `prepare_embeddings.py` and `train_models.py`. Keep all scripts in the same folder.
+`token_common.py` is imported by `extract_ntv3_tokens.py`. Keep all scripts in the same folder.
