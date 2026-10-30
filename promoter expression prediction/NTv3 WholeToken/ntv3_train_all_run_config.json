@@ -1,0 +1,13 @@
+{
+  "model": "InstaDeepAI/NTv3_650M_pre",
+  "dim": 1536,
+  "total_records": 6605587,
+  "selected_records": 6605587,
+  "sample_size": null,
+  "seed": 42,
+  "max_positions": 128,
+  "storage_dtype": "float16",
+  "padding_excluded": true,
+  "special_tokens_added": false,
+  "input_fasta": "/var2/finetune/embedding/preprocessed_train_sequences.fasta"
+}
