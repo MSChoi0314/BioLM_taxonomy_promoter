@@ -1,7 +1,7 @@
 # Genome Language embeddings for promoter-expression regression (DREAM 2022)
 
 Predict yeast promoter expression from DNA sequence by extracting embeddings, pooling them per sequence, and training lightweight regression heads (ResMLP, TabM; Ridge and LightGBM also supported). Evaluation follows the official **Random Promoter DREAM Challenge 2022** private-leaderboard logic.
-
+NTv3 WholeToken uses separate method of embedding and model training, therefore uses separate python files inside the directory 
 
 ---
 
