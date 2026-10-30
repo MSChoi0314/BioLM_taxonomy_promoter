@@ -11,10 +11,10 @@ FASTA (>id|exp=value)
    │
    ▼  extract_ntv3_tokens.py (+ token_common.py)
 NTv3-650M (frozen) → last hidden layer, 1 vector per nucleotide
-   │  → intermediate:  ntv3_*_run_config.json
+   │  → Run metadata:  ntv3_*_run_config.json
    ▼  train_token_cnn.py
-TokenResCNN on the token matrices
-   │  → intermediate: metrics_ntv3_wholetoken.json
+Perform TokenResCNN on the token matrices
+   │  → Run metadata: metrics_ntv3_wholetoken.json
    ▼  evaluate_dream_official.py
 Official DREAM subset scoring (weighted Pearson r² and Spearman ρ)
       
