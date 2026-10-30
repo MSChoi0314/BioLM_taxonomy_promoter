@@ -1,0 +1,28 @@
+{
+  "input_fasta": "/var2/finetune/embedding/preprocessed_test_sequences.fasta",
+  "output_prefix": "/var2/finetune/embedding/ntv3_test_mean",
+  "model_name": "InstaDeepAI/NTv3_650M_pre",
+  "expected_embedding_dimension": 1536,
+  "number_of_records": 71103,
+  "device": "cuda:0",
+  "model_dtype": "float32",
+  "storage_dtype": "float32",
+  "pooling": "mean",
+  "flush_interval": 5000,
+  "empty_cache_interval": 0,
+  "retry_failed": false,
+  "files": {
+    "embeddings": "/var2/finetune/embedding/ntv3_test_mean_embeddings.npy",
+    "expressions": "/var2/finetune/embedding/ntv3_test_mean_expressions.npy",
+    "status": "/var2/finetune/embedding/ntv3_test_mean_status.npy",
+    "meta": "/var2/finetune/embedding/ntv3_test_mean_meta.csv",
+    "warnings": "/var2/finetune/embedding/ntv3_test_mean_warnings.log",
+    "config": "/var2/finetune/embedding/ntv3_test_mean_run_config.json"
+  },
+  "status_codes": {
+    "0": "pending",
+    "1": "success",
+    "2": "failed"
+  },
+  "representation": "output.hidden_states[-1]"
+}
