@@ -11,16 +11,16 @@ NTv3 WholeToken uses separate method of embedding and model training, therefore 
 ```
 FASTA (>id|exp=value)
    │
-   ▼  scripts/run_*_promoter_fasta.py
+   ▼  run_*_promoter_fasta.py
 Genome language model provides embedding → mean or max pooling
-   │  → intermediate:  *_run_config.json
-   ▼  scripts/prepare_embeddings.py
+   │  → Run metadata:  *_run_config.json
+   ▼  prepare_embeddings.py
 Validate rows, keep successful/finite ones, random train/val split (default 5% val)
    │  
-   ▼  scripts/train_models.py
+   ▼  train_models.py
 Standardize features → train ResMLP / TabM / Ridge / LightGBM → predict external test set
-   │  → intermediate: run_config_*.json, metrics_*.json
-   ▼  scripts/evaluate_dream.py
+   │  → Run metadata: run_config_*.json, metrics_*.json
+   ▼  evaluate_dream.py
 Official DREAM subset scoring (weighted Pearson r² and Spearman ρ)
       
 ```
