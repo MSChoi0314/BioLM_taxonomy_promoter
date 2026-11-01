@@ -25,6 +25,10 @@ Training fasta file
                     (also reads labels and row order from B's prefix)       evaluation/evaluate_dream.py
 ```
 
+## Notes
+* The preprocessing script that builds the `|exp=` FASTA files is not included, and neither are the challenge data.
+* The `metadata/` folders are records of our runs. No script reads them.
+
 Dependence of location:
 * `prepare_embeddings.py` and `train_models.py` import `common.py`, so all three must stay in the same folder.
 * `extract_ntv3_tokens.py` does `from token_common import *` and needs `token_common.py` next to it.
