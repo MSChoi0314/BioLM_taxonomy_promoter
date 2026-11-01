@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs and temporary files
+*.log
+*.tmp
+*.incomplete
+
+# Large arrays and model checkpoints
+*.npy
+*.npz
+*.pt
+*.joblib
+
+# Run outputs and intermediate data
+results/
+prepared/
+token_embeddings/
+*_protein_embedding.csv
+methcocca_hdbscan_graphml_v2/
+methcocca_hdbscan_taxonomy_validation_v2/
+methcocca_gtdb_species_representative/
